@@ -1,23 +1,3 @@
-"""
-Pipeline: Hamiltonian JSON -> Exact Diagonalization -> SRE of Ground State
-
-Reads a molecular Hamiltonian in Pauli string JSON format, finds the lowest k
-eigenstates, and computes the Stabilizer Renyi Entropy (SRE) of the ground state.
-
-Usage:
-    # Local test (4 cores)
-    mpirun -n 4 python sre_pipeline.py ../hamiltonian_18_or_less/H2O_STO-3G_SINGLET_JW.json
-
-    # With SLEPc solver
-    mpirun -n 8 python sre_pipeline.py hamiltonian.json --solver slepc
-
-    # Save output to file
-    mpirun -n 16 python sre_pipeline.py hamiltonian.json --output results.txt
-
-    # Cluster (see submit_pipeline.sh)
-    sbatch submit_pipeline.sh
-"""
-
 import argparse
 import json
 import numpy as np
@@ -271,6 +251,7 @@ def make_hams(filepath,cspath):
     hf_energy  = data_dict['data']['calculated_properties']['HF']['energy']
     H = PauliwordOp.from_dictionary(data_dict['hamiltonian'])
     UCC_q = PauliwordOp.from_dictionary(data_dict['data']['auxiliary_operators']["UCCSD_operator"])
+    N_op = PauliwordOp.from_dictionary(data_dict["data"]["auxiliary_operators"]["number_operator"])
 
     # Print the extracted information
     print(f"Calculated Hartree-Fock Energy: {hf_energy}")
@@ -290,7 +271,7 @@ def make_hams(filepath,cspath):
     H_taper   = QT.taper_it(ref_state=hf_state)
     UCC_taper = QT.taper_it(aux_operator=UCC_q)
     hf_tap    = QT.tapered_ref_state
-
+    N_op_tap=QT.taper_it(aux_operator=N_op)
     method='LCU'
 
     # Build the CS-VQE model
@@ -306,53 +287,43 @@ def make_hams(filepath,cspath):
             print("Unitary partitioning failed under both methods")
             comm.Abort(1) 
             
-    # cs_vqe.contextual_operator.n_terms, cs_vqe.noncontextual_operator.n_terms
 
-    # print('The symmetry generators G are:\n')
-    # print(cs_vqe.noncontextual_operator.symmetry_generators); print()
-    # print('The clique operator A(r) is:\n')
-    # print(cs_vqe.noncontextual_operator.clique_operator); print()
-    # print(f'The optimal paramters are '+ 
-    #     f'nu={cs_vqe.noncontextual_operator.symmetry_generators.coeff_vec}, r={cs_vqe.noncontextual_operator.clique_operator.coeff_vec},')
-    # print(f'which yields a noncontextual energy of n(nu,r) = {cs_vqe.noncontextual_operator.energy}')
 
     # Now we project into the contextual subspace
     full_qubits=H_taper.n_qubits
     newpath=os.path.join(cspath,filename[:-5]+"_CS")
     if not os.path.exists(newpath):
         os.makedirs(newpath)
-    for i in range(1, full_qubits, 1):
+    for i in range(1, full_qubits+1, 1):
         cs_vqe.update_stabilizers(n_qubits = i, strategy='aux_preserving', aux_operator=UCC_taper)
+        contextual_terms=cs_vqe.contextual_operator.n_terms
+        noncon_terms=cs_vqe.noncontextual_operator.n_terms
+        n_cliques=cs_vqe.noncontextual_operator.n_cliques
         H_cs = cs_vqe.project_onto_subspace()
-        if full_qubits<=10:
-            hf_proj=cs_vqe.project_state(hf_tap).to_dense_matrix
+        N_cs=cs_vqe.project_onto_subspace(N_op_tap)
+
+        hf_proj=cs_vqe.project_state(hf_tap).to_dense_matrix
 
         out_filename=filename[:-5]+'_CS_'+str(i)+'.json'
-        file = open(os.path.join(newpath,out_filename), "w+")
-        ham_dict=H_cs.to_dictionary
-        for k,v in ham_dict.items():
-            ham_dict[k]=np.real(v)
-        data={
-            "hamiltonian": ham_dict,
-            "data": data_dict['data']
-        }
-        if full_qubits<=10:
-            data['data']['hf_proj']=hf_proj.real.tolist()
-        data['data']["tap_qubits"]=full_qubits
-        json.dump(data,file) 
+        with open(os.path.join(newpath,out_filename), "w+") as file:
+            ham_dict=H_cs.to_dictionary
+            for k,v in ham_dict.items():
+                ham_dict[k]=np.real(v)
+            N_dict=N_cs.to_dictionary
+            for k,v in N_dict.items():
+                N_dict[k]=np.real(v)
+
+            data={
+                "hamiltonian": ham_dict,
+                "hf_vec":hf_proj.real.tolist(),
+                "N_op": N_dict,
+                'con_terms':contextual_terms,
+                'noncon_terms':noncon_terms,
+                'n_cliques':n_cliques,
+                "data": data_dict['data']
+            }
+            json.dump(data,file) 
         print(f'{i} qubit CS Hamiltonian saved')
-    out_filename=filename[:-5]+'_CS_'+str(full_qubits)+'.json'
-    file = open(os.path.join(newpath,out_filename), "w+")
-    ham_dict=H_taper.to_dictionary
-    for k,v in ham_dict.items():
-        ham_dict[k]=np.real(v)
-    data={
-        "hamiltonian": ham_dict,
-        "data": data_dict['data']
-    }
-    data['data']["tap_qubits"]=full_qubits
-    data['data']['hf_proj']=hf_tap.to_dense_matrix.real.tolist()
-    json.dump(data,file) 
     print(f'{full_qubits} qubit CS Hamiltonian saved')
     print('All CS Hamiltonians saved!')
     return newpath
@@ -369,6 +340,8 @@ def load_hamiltonian(filepath):
     Returns:
         H_sparse: scipy sparse matrix of the Hamiltonian
         n_qubits: number of qubits
+        hf_proj: the HF reference in that contextual subspace
+        N_op: the number operator in that contextual subspace
         metadata: dict of molecular data
         full_qubits:
     """
@@ -380,12 +353,15 @@ def load_hamiltonian(filepath):
     #pauli_coeff_dict = {k: v for k, v in ham_dict.items()}
     #H_op = PauliwordOp.from_dictionary(pauli_coeff_dict)
     H_op = PauliwordOp.from_dictionary(data['hamiltonian'])
-    print("PauliwordOp constructed")
+    print("Hamiltonian PauliwordOp constructed")
     H_sparse = H_op.to_sparse_matrix
-    print("Sparse matrix representation constructed")
-    
+    print("Hamiltonian sparse matrix representation constructed")
+    N_op=PauliwordOp.from_dictionary(data['N_op'])
+    print("Number operator PauliwordOp constructed")
+    hf_proj=QuantumState.from_array(np.array(data['hf_vec']))
+    print("HF QuantumState created")
     n_qubits = H_op.n_qubits
-    return H_sparse, n_qubits, metadata
+    return H_sparse, n_qubits,hf_proj,N_op, metadata
 
 
 def eigvec_to_quantumstate(eigvec, n_qubits, threshold=1e-12):
@@ -402,106 +378,32 @@ def eigvec_to_quantumstate(eigvec, n_qubits, threshold=1e-12):
     return QuantumState.from_dictionary(state_dict)
 
 
-def diag_scipy(H_sparse, k):
+def diag_scipy(H_sparse,hf_proj,N_proj,N_target, k=4,tol=1e-9):
     """Find k lowest eigenpairs using scipy Lanczos (single-node)."""
+    M_N = N_proj.to_sparse_matrix
+    hf_vec = hf_proj.normalize.to_sparse_matrix.toarray().flatten()
+
     if H_sparse.shape[0]-1<=k:
         from numpy.linalg import eigh
-        eigenvalues, eigenvectors = eigh(H_sparse.todense())
+        eigenvalues, eigenvectors = eigh(H_sparse.toarray())
+        idx = np.argsort(eigenvalues)
+        eigenvalues,eigenvectors=eigenvalues[idx],eigenvectors[:,idx]
+        for i in range(len(eigenvalues)):
+            n_exp = (eigenvectors[:,i].conj() @(M_N @ eigenvectors[:,i])).real
+            if abs(n_exp-N_target) < 1e-3:
+                return np.array([float(eigenvalues[i].real)]),eigenvectors[:,i:i+1]
+        raise RuntimeError(f"No N={N_target} eigenvector found in full diagonalization!")
     else:
         from scipy.sparse.linalg import eigsh
-        eigenvalues, eigenvectors = eigsh(H_sparse, k=k, which='SA')
-    idx = np.argsort(eigenvalues)
-    return eigenvalues[idx], eigenvectors[:, idx]
-
-
-def diag_slepc(H_scipy, k, comm):
-    """Find k lowest eigenpairs using SLEPc (MPI-distributed).
-
-    Each rank inserts its local rows into a PETSc matrix, then SLEPc
-    solves the eigenvalue problem in parallel. Eigenvectors are gathered
-    to all ranks.
-    """
-    try:
-        from petsc4py import PETSc
-        from slepc4py import SLEPc
-    except ImportError:
-        raise ImportError(
-            "SLEPc solver requires petsc4py and slepc4py.\n"
-            "Install with: conda install -c conda-forge petsc4py slepc4py"
-        )
-
-    dim = H_scipy.shape[0]
-    H_csr = H_scipy.tocsr()
-
-    # PETSc compiled with real scalars requires real-valued matrix.
-    # Molecular Hamiltonians are Hermitian with real matrix elements
-    # (imaginary parts from Y-Paulis cancel in the full sum).
-    if np.issubdtype(H_csr.dtype, np.complexfloating):
-        max_imag = np.max(np.abs(H_csr.data.imag)) if H_csr.nnz > 0 else 0
-        if max_imag > 1e-10:
-            raise ValueError(
-                f"Hamiltonian has non-negligible imaginary entries (max={max_imag:.2e}). "
-                f"PETSc is compiled with real scalars. Rebuild PETSc with "
-                f"--with-scalar-type=complex, or check your Hamiltonian."
-            )
-        H_csr = H_csr.real.tocsr()
-
-    A = PETSc.Mat().create(comm)
-    A.setSizes([dim, dim])
-    A.setType('aij')
-    nnz_per_row = np.diff(H_csr.indptr)
-    A.setPreallocationNNZ(int(nnz_per_row.max()) if len(nnz_per_row) else 1)
-    A.setUp()
-
-    # Each rank fills only its local rows
-    rstart, rend = A.getOwnershipRange()
-    for i in range(rstart, rend):
-        rs, re = H_csr.indptr[i], H_csr.indptr[i + 1]
-        if rs < re:
-            cols = H_csr.indices[rs:re].astype(PETSc.IntType)
-            vals = H_csr.data[rs:re].astype(PETSc.ScalarType)
-            A.setValues([i], cols, vals)
-
-    A.assemblyBegin()
-    A.assemblyEnd()
-
-    # SLEPc eigensolver
-    eps = SLEPc.EPS().create(comm)
-    eps.setOperators(A)
-    eps.setProblemType(SLEPc.EPS.ProblemType.HEP)
-    eps.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_REAL)
-    eps.setDimensions(nev=k)
-    eps.setFromOptions()  
-    eps.solve()
-
-    nconv = eps.getConverged()
-    if nconv < k and comm.Get_rank() == 0:
-        print(f"  WARNING: SLEPc converged {nconv}/{k} eigenpairs")
-
-    eigenvalues = []
-    eigenvectors = []
-    vr, vi = A.createVecs()
-
-    for i in range(min(nconv, k)):
-        eigenvalues.append(eps.getEigenvalue(i).real)
-        eps.getEigenvector(i, vr, vi)
-        # Gather full vector to all ranks
-        scatter, vec_all = PETSc.Scatter.toAll(vr)
-        scatter.scatter(vr, vec_all)
-        eigenvectors.append(np.array(vec_all))
-        scatter.destroy()
-        vec_all.destroy()
-
-    vr.destroy()
-    vi.destroy()
-    eps.destroy()
-    A.destroy()
-
-    eigenvalues = np.array(eigenvalues)
-    eigenvectors = np.column_stack(eigenvectors) if eigenvectors else np.empty((dim, 0))
-    idx = np.argsort(eigenvalues)
-    return eigenvalues[idx], eigenvectors[:, idx]
-
+        for k_try in (k, 2*k, 4*k):
+            if k_try >= H_sparse.shape[0]:
+                break
+            vals, vecs = eigsh(H_sparse, k=k_try, which="SA", v0=hf_vec, tol=tol)
+            for i in np.argsort(vals.real):
+                n_exp = (vecs[:, i].conj() @ (M_N @ vecs[:, i])).real
+                if abs(n_exp - N_target) < 1e-3:
+                    return np.array([float(vals[i].real)]), vecs[:, i:i+1]
+        raise RuntimeError(f"No N={N_target} eigenvector found within k={k_try}")
 
 
 def main():
@@ -560,8 +462,8 @@ Examples:
         if rank == 0:
             # Only rank 0 should load the file!
             print(f"Loading: {ham_file}")
-            H_sparse, n_qubits, metadata = load_hamiltonian(os.path.join(folder,ham_file))
-            
+            H_sparse, n_qubits,hf_proj,N_op, metadata = load_hamiltonian(os.path.join(folder,ham_file))
+            n_particles=metadata["n_particles"]["total"]
             print(f"  n_qubits  = {n_qubits}")
             print(f"  dim       = {2**n_qubits}")
             print(f"  nnz       = {H_sparse.nnz}")
@@ -576,10 +478,12 @@ Examples:
         else:
             H_sparse = None
             n_qubits = None
+            n_particles=None
             metadata = None
 
         n_qubits = comm.bcast(n_qubits, root=0)
         metadata = comm.bcast(metadata, root=0)
+        n_particles=comm.bcast(n_particles,root=0)
 
         #  Diagonalize 
         if rank == 0:
@@ -590,17 +494,12 @@ Examples:
         if args.solver == 'scipy':
             # Only rank 0 diagonalizes, then broadcasts results
             if rank == 0:
-                eigenvalues, eigenvectors = diag_scipy(H_sparse, args.k)
+                eigenvalues, eigenvectors = diag_scipy(H_sparse,hf_proj=hf_proj,N_proj=N_op,N_target=n_particles,k=args.k)
             else:
                 eigenvalues = None
                 eigenvectors = None
             eigenvalues = comm.bcast(eigenvalues, root=0)
             eigenvectors = comm.bcast(eigenvectors, root=0)
-
-        elif args.solver == 'slepc':
-            H_sparse = comm.bcast(H_sparse, root=0)
-            # All ranks participate in distributed diagonalization
-            eigenvalues, eigenvectors = diag_slepc(H_sparse, args.k, comm)
 
         t_diag = time.perf_counter() - t0
         terminate = False
@@ -628,7 +527,7 @@ Examples:
                 # Check for Symmer failures
                     if eigenvalues[0]-hf_en>= 1e-8:
                         print(f"Symmer failure detected!")
-                        print(f"E0-HF = {eigenvalues[0] - hf_en:.2e}<0")
+                        print(f"E0-HF = {eigenvalues[0] - hf_en:.2e}>0")
                         print(f"Terminating evaluation")
                         terminate = True
                 
@@ -682,10 +581,9 @@ Examples:
             parallel='mpi'
         )
 
-        if rank==0 and 'hf_proj' in metadata.keys():
+        if rank==0:
             print(f'Calculating HF-CS overlap')
-            hf_proj=metadata['hf_proj']
-            overlap=np.abs(np.dot(np.array(hf_proj).flatten(),np.array(gs_vec).flatten()))**2
+            overlap=np.abs(ground_state.dagger*hf_proj)**2
             overlaps.append(overlap)
 
         t_sre = time.perf_counter() - t0
@@ -716,19 +614,19 @@ Examples:
                 os.makedirs(args.output)
             filename = args.hamiltonian.split('/')[-1]
             outfile=os.path.join(args.output,"data_"+filename)
-            file = open(outfile, "w+")
             data = {
-                'n_qubits' : metadata['tap_qubits'],
-                'qubits'    : cs_size_list,
-                'fci_energy' : fci_en,
-                'hf_energy' : metadata['calculated_properties']['HF']['energy'],
-                "CS_SRE" : gs_sre,
-                "CS_energy": tap_nrg_true,
-                'overlaps': overlaps,
-                "solver": args.solver,
-                'data' : metadata
-            }
-            json.dump(data,file) 
+                    'n_qubits' : n_qubits,
+                    'qubits'    : cs_size_list,
+                    'fci_energy' : fci_en,
+                    'hf_energy' : metadata['calculated_properties']['HF']['energy'],
+                    "CS_SRE" : gs_sre,
+                    "CS_energy": tap_nrg_true,
+                    'overlaps': overlaps,
+                    "solver": args.solver,
+                    'data' : metadata
+                }
+            with open(outfile, "w+") as file:
+                json.dump(data,file) 
             
 if __name__ == '__main__':
     try:
